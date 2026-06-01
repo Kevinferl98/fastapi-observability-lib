@@ -53,7 +53,7 @@ def setup_observability(
 
     for logger_name, cfg in target_loggers.items():
         tgt_logger = logging.getLogger(logger_name)
-        tgt_logger.handles = [stdlib_handler]
+        tgt_logger.handlers = [stdlib_handler]
         tgt_logger.setLevel(cfg.get("level", numeric_level))
         tgt_logger.propagate = False
 

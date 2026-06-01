@@ -1,191 +1,213 @@
-import logging
+import uuid
 import pytest
-from fastapi import FastAPI, Request
+from types import SimpleNamespace
+from fastapi import FastAPI, Request, Response
 from fastapi.testclient import TestClient
-from starlette.responses import Response, StreamingResponse
-from src.my_observability import middleware
+from my_observability import middleware
 
-LOGGER_NAME = "my_observability.middleware"
+class RecordingLogger:
+    def __init__(self):
+        self.calls = []
 
-def test_sanitize_headers():
-    raw_headers = {
-        "Authorization": "Bearer secret_token",
-        "Cookie": "session=xyz",
-        "Content-Type": "application/json",
-        "X-Custom-Header": "not-in-visible-set",
-    }
-    visible_set = {"content-type"}
+    def info(self, event, **payload):
+        self.calls.append(("info", event, payload))
 
-    sanitized = middleware._sanitize_headers(raw_headers, visible_set)
+    def warning(self, event, **payload):
+        self.calls.append(("warning", event, payload))
 
-    assert sanitized["authorization"] == "[REDACTED]"
-    assert sanitized["cookie"] == "[REDACTED]"
-    assert sanitized["content-type"] == "application/json"
-    assert "x-custom-header" not in sanitized
+    def error(self, event, **payload):
+        self.calls.append(("error", event, payload))
 
-@pytest.mark.parametrize(
-    "text, max_bytes, expected_text, expected_truncated",
-    [
-        ("hello", 10, "hello", False),
-        ("hello world", 5, "hello", True),
-        ("⚡⚡", 3, "⚡", True),
-    ],
-)
-def test_truncate_text(text, max_bytes, expected_text, expected_truncated):
-    res_text, truncated = middleware._truncate_text(text, max_bytes)
-    assert res_text == expected_text
-    assert truncated == expected_truncated
+    def exception(self, event, **payload):
+        self.calls.append(("exception", event, payload))
 
-@pytest.mark.parametrize(
-    "content_type, expected",
-    [
-        ("application/json", True),
-        ("application/problem+json", True),
-        ("text/html", True),
-        ("image/jpeg", False),
-        (None, False),
-    ],
-)
-def test_is_text_payload(content_type, expected):
-    assert middleware._is_text_payload(content_type) == expected
+@pytest.fixture
+def recording_logger(monkeypatch):
+    logger = RecordingLogger()
+    monkeypatch.setattr(middleware, "logger", logger)
+    return logger
 
-def test_decode_body_binary_payload():
-    binary_data = b"\x00\x01\x02\x03"
-    text, truncated = middleware._decode_body(binary_data, "application/octet-stream", 100)
-    assert text == "[BINARY:4 bytes]"
-    assert truncated is False
+@pytest.fixture
+def contextvars_spy(monkeypatch):
+    calls = {"clear": 0, "bind": []}
+
+    def clear_contextvars():
+        calls["clear"] += 1
+
+    def bind_contextvars(**kwargs):
+        calls["bind"].append(kwargs)
+
+    monkeypatch.setattr(
+        middleware.structlog.contextvars,
+        "clear_contextvars",
+        clear_contextvars,
+    )
+    monkeypatch.setattr(
+        middleware.structlog.contextvars,
+        "bind_contextvars",
+        bind_contextvars,
+    )
+    return calls
 
 @pytest.fixture
 def app():
-    return FastAPI()
+    test_app = FastAPI()
 
-def test_middleware_logs_basic_request_without_bodies(app, caplog):
-    middleware.setup_http_logging(app, log_bodies=False)
+    @test_app.get("/ok")
+    async def ok(request: Request):
+        return {"request_id": request.state.request_id}
 
-    @app.get("/health")
-    def health_check():
-        return {"status": "healthy"}
+    @test_app.get("/client-error")
+    async def client_error():
+        return Response(status_code=404)
 
-    client = TestClient(app)
+    @test_app.get("/server-error")
+    async def server_error():
+        return Response(status_code=500)
 
-    with caplog.at_level(logging.INFO, logger=LOGGER_NAME):
-        response = client.get("/health", headers={"X-Request-ID": "external-uuid-123"})
+    @test_app.get("/runtime-error")
+    async def runtime_error():
+        raise RuntimeError("runtime-error")
 
-    assert response.status_code == 200
+    middleware.setup_http_logging(test_app)
+    return test_app
 
-    middleware_logs = [r for r in caplog.records if r.name == LOGGER_NAME]
-    assert len(middleware_logs) == 1
+def test_sanitize_headers_redacts_sensitive_values_case_insensitively():
+    assert middleware._sanitize_headers(
+        {
+            "Authorization": "Bearer secret",
+            "Cookie": "session=secret",
+            "Set-Cookie": "session=secret",
+            "X-Api-Key": "secret-api-key",
+            "TOKEN": "secret-token",
+            "X-Correlation-Id": "public-value",
+        }
+    ) == {
+        "authorization": "[REDACTED]",
+        "cookie": "[REDACTED]",
+        "set-cookie": "[REDACTED]",
+        "x-api-key": "[REDACTED]",
+        "token": "[REDACTED]",
+        "x-correlation-id": "public-value",
+    }
 
-    log_record = middleware_logs[0]
-    assert log_record.message == "http_request"
+def test_successful_request_logs_sanitized_payload_and_propagates_request_id(
+    app,
+    contextvars_spy,
+    monkeypatch,
+    recording_logger,
+):
+    perf_counter_values = [10.0, 10.12345]
 
-    extra = log_record.__dict__.get("extra", log_record.__dict__)
-    assert extra["request_id"] == "external-uuid-123"
-    assert extra["path"] == "/health"
-    assert extra["status_code"] == 200
-    assert "request_body" not in extra
+    def perf_counter():
+        if len(perf_counter_values) > 1:
+            return perf_counter_values.pop(0)
+        return perf_counter_values[0]
 
-def test_middleware_logs_and_parses_valid_json_bodies(app, caplog):
-    middleware.setup_http_logging(app, log_bodies=True, max_body_bytes=512)
+    monkeypatch.setattr(middleware, "time", SimpleNamespace(perf_counter=perf_counter))
 
-    @app.post("/api/v1/data")
-    async def process_data(request: Request):
-        return {"status": "processed"}
-
-    client = TestClient(app)
-    req_payload = {"user_id": 42, "action": "click"}
-
-    with caplog.at_level(logging.INFO, logger=LOGGER_NAME):
-        client.post("/api/v1/data", json=req_payload)
-
-    middleware_logs = [r for r in caplog.records if r.name == LOGGER_NAME]
-    assert len(middleware_logs) == 1
-
-    extra = middleware_logs[0].__dict__
-    assert extra["request_body"] == req_payload
-    assert extra["response_body"] == {"status": "processed"}
-    assert extra["request_body_truncated"] is False
-    assert extra["response_body_truncated"] is False
-
-def test_middleware_truncates_payloads_exceeding_max_bytes(app, caplog):
-    middleware.setup_http_logging(app, log_bodies=True, max_body_bytes=5)
-
-    @app.post("/echo")
-    def echo_text():
-        return "test-long-response"
-
-    client = TestClient(app)
-
-    with caplog.at_level(logging.INFO, logger=LOGGER_NAME):
-        client.post("/echo", content="test-long-request", headers={"content-type": "text/plain"})
-
-    middleware_logs = [r for r in caplog.records if r.name == LOGGER_NAME]
-    assert len(middleware_logs) == 1
-    extra = middleware_logs[0].__dict__
-
-    assert extra["request_body_truncated"] is True
-    assert extra["response_body_truncated"] is True
-
-    assert len(extra["request_body"].encode("utf-8")) <= 5
-    assert len(extra["response_body"].encode("utf-8")) <= 5
-
-def test_middleware_logs_exception_on_endpoint_crash(app, caplog):
-    middleware.setup_http_logging(app, log_bodies=False)
-
-    @app.get("/unhandled-crash")
-    def crash():
-        raise RuntimeError("Database connection lost")
-
-    client = TestClient(app)
-
-    with pytest.raises(RuntimeError, match="Database connection lost"):
-        with caplog.at_level(logging.ERROR, logger=LOGGER_NAME):
-            client.get("/unhandled-crash")
-
-    middleware_logs = [r for r in caplog.records if r.name == LOGGER_NAME]
-    assert len(middleware_logs) == 1
-
-    log_record = middleware_logs[0]
-    assert log_record.message == "http_request_failed"
-    assert log_record.levelname == "ERROR"
-    assert log_record.exc_info is not None
-
-def test_middleware_logs_error_level_for_5xx_responses(app, caplog):
-    middleware.setup_http_logging(app, log_bodies=False)
-
-    @app.get("/bad-gateway")
-    def gateway_error():
-        return Response(status_code=502, content="Bad Gateway")
-
-    client = TestClient(app)
-
-    with caplog.at_level(logging.ERROR, logger=LOGGER_NAME):
-        client.get("/bad-gateway")
-
-    middleware_logs = [r for r in caplog.records if r.name == LOGGER_NAME]
-    assert len(middleware_logs) == 1
-    assert middleware_logs[0].message == "http_request"
-    assert middleware_logs[0].levelname == "ERROR"
-
-def test_middleware_preserves_streaming_responses(app, caplog):
-    middleware.setup_http_logging(app, log_bodies=True, max_body_bytes=1024)
-
-    @app.get("/stream")
-    def stream_endpoint():
-        def chunks():
-            yield b"part1 "
-            yield b"part2"
-
-        return StreamingResponse(chunks(), media_type="text/plain")
-
-    client = TestClient(app)
-
-    with caplog.at_level(logging.INFO, logger=LOGGER_NAME):
-        response = client.get("/stream")
+    response = TestClient(app).get(
+        "/ok?search=value",
+        headers={
+            "X-Request-Id": "req-123",
+            "Authorization": "Bearer secret",
+            "X-Api-Key": "secret-api-key",
+            "X-Correlation-Id": "public-value",
+        },
+    )
 
     assert response.status_code == 200
-    assert response.text == "part1 part2"
+    assert response.json() == {"request_id": "req-123"}
+    assert response.headers["x-request-id"] == "req-123"
+    assert contextvars_spy == {
+        "clear": 1,
+        "bind": [{"request_id": "req-123", "method": "GET", "path": "/ok"}],
+    }
+    assert len(recording_logger.calls) == 1
+    level, event, payload = recording_logger.calls[0]
+    assert level == "info"
+    assert event == "http_request_completed"
+    assert payload["status_code"] == 200
+    assert payload["duration_ms"] == 123.45
+    assert payload["client_ip"] == "testclient"
+    assert payload["query_string"] == "search=value"
+    assert {
+        "authorization": "[REDACTED]",
+        "x-api-key": "[REDACTED]",
+        "x-correlation-id": "public-value",
+        "x-request-id": "req-123",
+    }.items() <= payload["request_headers"].items()
 
-    middleware_logs = [r for r in caplog.records if r.name == LOGGER_NAME]
-    extra = middleware_logs[0].__dict__
-    assert extra["response_body"] == "part1 part2"
+@pytest.mark.parametrize(
+    ("path", "expected_level", "expected_status_code"),
+    [
+        ("/ok", "info", 200),
+        ("/client-error", "warning", 404),
+        ("/server-error", "error", 500),
+    ],
+)
+def test_completed_request_log_level_depends_on_status_code(
+    app,
+    recording_logger,
+    path,
+    expected_level,
+    expected_status_code,
+):
+    response = TestClient(app).get(path, headers={"X-Request-Id": "req-status"})
+
+    assert response.status_code == expected_status_code
+    assert recording_logger.calls[-1][0] == expected_level
+    assert recording_logger.calls[-1][1] == "http_request_completed"
+    assert recording_logger.calls[-1][2]["status_code"] == expected_status_code
+
+def test_missing_request_id_generates_uuid(monkeypatch, recording_logger):
+    generated_uuid = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    monkeypatch.setattr(middleware.uuid, "uuid4", lambda: generated_uuid)
+
+    test_app = FastAPI()
+
+    @test_app.get("/generated")
+    async def generated(request: Request):
+        return {"request_id": request.state.request_id}
+
+    test_app.add_middleware(middleware.StructuredLoggingMiddleware)
+
+    response = TestClient(test_app).get("/generated")
+
+    assert response.status_code == 200
+    assert response.json() == {"request_id": str(generated_uuid)}
+    assert response.headers["x-request-id"] == str(generated_uuid)
+    assert recording_logger.calls[0][2]["request_headers"].get("x-request-id") is None
+
+def test_failed_request_logs_exception_payload_and_reraises(
+    app,
+    recording_logger,
+):
+    with pytest.raises(RuntimeError, match="runtime-error"):
+        TestClient(app).get(
+            "/runtime-error",
+            headers={
+                "X-Request-Id": "req-failed",
+                "Authorization": "Bearer secret",
+            },
+        )
+
+    assert len(recording_logger.calls) == 1
+    level, event, payload = recording_logger.calls[0]
+    assert level == "exception"
+    assert event == "http_request_failed"
+    assert payload["duration_ms"] >= 0
+    assert payload["client_ip"] == "testclient"
+    assert payload["exception_message"] == "runtime-error"
+    assert {
+        "x-request-id": "req-failed",
+        "authorization": "[REDACTED]",
+    }.items() <= payload["request_headers"].items()
+
+def test_setup_http_logging_registers_structured_logging_middleware():
+    test_app = FastAPI()
+
+    middleware.setup_http_logging(test_app)
+
+    assert len(test_app.user_middleware) == 1
+    assert test_app.user_middleware[0].cls is middleware.StructuredLoggingMiddleware
