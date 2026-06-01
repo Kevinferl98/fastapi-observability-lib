@@ -1,45 +1,46 @@
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
+from typing import Optional
 
-_provider = None
+_trace_provider: Optional[TracerProvider] = None
 
-def _build_sampler(sampler_type: str = "parentbased_traceidratio", sampler_arg: float = 1.0):
-    # Keep parent sampling decisions across service boundaries to avoid
-    # partial traces when requests span multiple services.
-    if sampler_type == "parentbased_traceidratio":
-        return ParentBased(TraceIdRatioBased(sampler_arg))
-    if sampler_type == "traceidratio":
-        return TraceIdRatioBased(sampler_arg)
-    return ParentBased(TraceIdRatioBased(1.0))
+def _build_sampler(sampler_ratio: float = 1.0) -> ParentBased:
+    return ParentBased(root=TraceIdRatioBased(sampler_ratio))
 
-
-def setup_telemetry(app, enabled: bool, service_name: str, environment: str, endpoint: str) -> None:
-    global _provider
-    if not enabled:
+def init_telemetry(
+        service_name: str,
+        environment: str,
+        endpoint: str,
+        sampler_ratio: float = 1.0,
+        service_version: str = "1.0.0",
+) -> None:
+    global _trace_provider
+    if _trace_provider is not None:
         return
 
     resource = Resource.create(
         {
             "service.name": service_name,
             "deployment.environment": environment,
-            "service.version": "1.0.0",
+            "service.version": service_version
         }
     )
 
-    provider = TracerProvider(resource=resource, sampler=_build_sampler())
-    exporter = OTLPSpanExporter(endpoint=endpoint, insecure=True)
-    provider.add_span_processor(BatchSpanProcessor(exporter))
-    trace.set_tracer_provider(provider)
-    FastAPIInstrumentor.instrument_app(app)
-    _provider = provider
+    provider = TracerProvider(resource=resource, sampler=_build_sampler(sampler_ratio))
 
+    exporter = OTLPSpanExporter(endpoint=endpoint, insecure=True)
+
+    provider.add_span_processor(BatchSpanProcessor(exporter))
+
+    trace.set_tracer_provider(provider)
+    _trace_provider = provider
 
 def shutdown_telemetry() -> None:
-    if _provider is not None:
-        # Flush pending spans before process shutdown to avoid trace loss.
-        _provider.shutdown()
+    global _trace_provider
+    if _trace_provider is not None:
+        _trace_provider.shutdown()
+        _trace_provider = None
