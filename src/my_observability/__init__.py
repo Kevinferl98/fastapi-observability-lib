@@ -1,12 +1,15 @@
-from .config import setup_logging
-from .formatter import JsonFormatter
-from .middleware import setup_http_logging
-from .telemetry import setup_telemetry, shutdown_telemetry
+from structlog import get_logger as get_structlog_logger
+from .config import setup_observability
+from .middleware import setup_http_logging, StructuredLoggingMiddleware
+from .telemetry import init_telemetry, shutdown_telemetry
+
+get_logger = get_structlog_logger
 
 __all__ = [
-    "setup_logging",
-    "JsonFormatter",
+    "setup_observability",
     "setup_http_logging",
-    "setup_telemetry",
+    "StructuredLoggingMiddleware",
+    "init_telemetry",
     "shutdown_telemetry",
+    "get_logger",
 ]
