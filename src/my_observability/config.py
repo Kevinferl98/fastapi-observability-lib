@@ -56,3 +56,6 @@ def setup_observability(
         tgt_logger.handles = [stdlib_handler]
         tgt_logger.setLevel(cfg.get("level", numeric_level))
         tgt_logger.propagate = False
+
+    root_logger = logging.getLogger()
+    root_logger.handlers = [stdlib_handler]
