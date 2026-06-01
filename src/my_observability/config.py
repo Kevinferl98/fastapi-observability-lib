@@ -36,7 +36,7 @@ def setup_observability(
     stdlib_handler = logging.StreamHandler(sys.stdout)
     stdlib_handler.setFormatter(structlog.stdlib.ProcessorFormatter(
         processor = structlog.processors.JSONRenderer(),
-        foreign_pre_processors = [
+        foreign_pre_chain = [
             structlog.processors.add_log_level,
             structlog.processors.TimeStamper(fmt="iso", utc=True, key="timestamp"),
         ]
