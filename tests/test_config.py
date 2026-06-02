@@ -1,211 +1,234 @@
 import io
 import logging
 import pytest
+from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Any
 from my_observability import config
-from my_observability.processor import inject_opentelemetry_context
 
-TARGET_LOGGER_NAMES = (
-    "uvicorn",
-    "uvicorn.error",
-    "uvicorn.access",
-    "custom.logger",
-)
+MANAGED_LOGGERS = {
+    "uvicorn": logging.INFO,
+    "uvicorn.error": logging.INFO,
+    "uvicorn.access": logging.WARNING,
+    "werkzeug": logging.INFO,
+    "django": logging.INFO,
+    "django.request": logging.INFO,
+    "celery": logging.INFO,
+    "amqp": logging.WARNING,
+    "kafka": logging.WARNING,
+}
+
+@dataclass
+class StructlogHarness:
+    stdout: io.StringIO
+    configure_kwargs: dict[str, Any]
+    filtering_levels: list[int]
+    formatter_kwargs: list[dict[str, Any]]
+    FilteringBoundLogger: type
+    TimeStamper: type
+    JSONRenderer: type
+    ProcessorFormatter: type
 
 @pytest.fixture(autouse=True)
-def restore_logging_state():
+def preserve_logging_state():
     root_logger = logging.getLogger()
     original_root_handlers = list(root_logger.handlers)
     original_root_level = root_logger.level
-    original_logger_state = {}
-
-    for logger_name in TARGET_LOGGER_NAMES:
-        logger = logging.getLogger(logger_name)
-        original_logger_state[logger_name] = {
-            "handlers": list(logger.handlers),
-            "level": logger.level,
-            "propagate": logger.propagate,
-            "handles": getattr(logger, "handles", None),
-            "had_handles": hasattr(logger, "handles"),
+    logger_names = (*MANAGED_LOGGERS, "custom.logger")
+    original_loggers = {
+        name: {
+            "handlers": list(logging.getLogger(name).handlers),
+            "level": logging.getLogger(name).level,
+            "propagate": logging.getLogger(name).propagate,
         }
+        for name in logger_names
+    }
 
     yield
 
     root_logger.handlers = original_root_handlers
     root_logger.setLevel(original_root_level)
 
-    for logger_name, state in original_logger_state.items():
-        logger = logging.getLogger(logger_name)
+    for name, state in original_loggers.items():
+        logger = logging.getLogger(name)
         logger.handlers = state["handlers"]
         logger.setLevel(state["level"])
         logger.propagate = state["propagate"]
-        if state["had_handles"]:
-            logger.handles = state["handles"]
-        elif hasattr(logger, "handles"):
-            delattr(logger, "handles")
 
 @pytest.fixture
-def structlog_spies(monkeypatch):
+def structlog_harness(monkeypatch):
     stdout = io.StringIO()
-    calls = {
-        "basic_config": None,
-        "configure": None,
-        "filtering_levels": [],
-        "print_logger_files": [],
-        "formatter_kwargs": [],
-        "timestamp_kwargs": [],
-        "json_renderer_calls": 0,
-    }
+    configure_kwargs = {}
+    filtering_levels = []
+    formatter_kwargs = []
 
-    class FakeFilteringBoundLogger:
+    class FilteringBoundLogger:
         pass
 
-    class FakePrintLoggerFactory:
+    class PrintLoggerFactory:
         def __init__(self, file):
-            calls["print_logger_files"].append(file)
             self.file = file
 
-    class FakeTimeStamper:
+    class TimeStamper:
         def __init__(self, **kwargs):
-            calls["timestamp_kwargs"].append(kwargs)
             self.kwargs = kwargs
 
-    class FakeJSONRenderer:
-        def __init__(self):
-            calls["json_renderer_calls"] += 1
+    class JSONRenderer:
+        pass
 
-    class FakeProcessorFormatter:
+    class ProcessorFormatter:
+        @staticmethod
+        def wrap_for_formatter(*args, **kwargs):
+            return None
+
         def __init__(self, **kwargs):
-            calls["formatter_kwargs"].append(kwargs)
+            formatter_kwargs.append(kwargs)
             self.kwargs = kwargs
 
-    def fake_basic_config(**kwargs):
-        calls["basic_config"] = kwargs
+    def configure(**kwargs):
+        configure_kwargs.update(kwargs)
 
-    def fake_configure(**kwargs):
-        calls["configure"] = kwargs
-
-    def fake_make_filtering_bound_logger(level):
-        calls["filtering_levels"].append(level)
-        return FakeFilteringBoundLogger
+    def make_filtering_bound_logger(level):
+        filtering_levels.append(level)
+        return FilteringBoundLogger
 
     monkeypatch.setattr(config, "sys", SimpleNamespace(stdout=stdout))
-    monkeypatch.setattr(config.logging, "basicConfig", fake_basic_config)
-    monkeypatch.setattr(config.structlog, "configure", fake_configure)
+    monkeypatch.setattr(config.structlog, "configure", configure)
     monkeypatch.setattr(
         config.structlog,
         "make_filtering_bound_logger",
-        fake_make_filtering_bound_logger,
+        make_filtering_bound_logger,
     )
-    monkeypatch.setattr(config.structlog, "PrintLoggerFactory", FakePrintLoggerFactory)
-    monkeypatch.setattr(config.structlog.processors, "TimeStamper", FakeTimeStamper)
-    monkeypatch.setattr(config.structlog.processors, "JSONRenderer", FakeJSONRenderer)
+    monkeypatch.setattr(config.structlog, "PrintLoggerFactory", PrintLoggerFactory)
+    monkeypatch.setattr(config.structlog.processors, "TimeStamper", TimeStamper)
+    monkeypatch.setattr(config.structlog.processors, "JSONRenderer", JSONRenderer)
     monkeypatch.setattr(
         config.structlog.stdlib,
         "ProcessorFormatter",
-        FakeProcessorFormatter,
+        ProcessorFormatter,
     )
 
-    return calls, stdout, FakeFilteringBoundLogger, FakeProcessorFormatter
+    return StructlogHarness(
+        stdout=stdout,
+        configure_kwargs=configure_kwargs,
+        filtering_levels=filtering_levels,
+        formatter_kwargs=formatter_kwargs,
+        FilteringBoundLogger=FilteringBoundLogger,
+        TimeStamper=TimeStamper,
+        JSONRenderer=JSONRenderer,
+        ProcessorFormatter=ProcessorFormatter,
+    )
 
-def test_setup_observability_configures_structlog_processors_in_expected_order(
-    structlog_spies,
-):
-    calls, stdout, fake_filtering_bound_logger, _ = structlog_spies
+def processor_pipeline_names(
+    processors: list[Any],
+    harness: StructlogHarness,
+) -> list[str]:
+    names = []
 
+    for processor in processors:
+        if processor is config.structlog.contextvars.merge_contextvars:
+            names.append("merge_contextvars")
+        elif processor is config.structlog.processors.add_log_level:
+            names.append("add_log_level")
+        elif isinstance(processor, harness.TimeStamper):
+            names.append("timestamp")
+        elif processor is config.structlog.processors.format_exc_info:
+            names.append("format_exc_info")
+        elif processor is config.structlog.processors.dict_tracebacks:
+            names.append("dict_tracebacks")
+        elif processor is config.inject_opentelemetry_context:
+            names.append("inject_opentelemetry_context")
+        elif isinstance(processor, harness.JSONRenderer):
+            names.append("json_renderer")
+        elif processor is harness.ProcessorFormatter.wrap_for_formatter:
+            names.append("wrap_for_formatter")
+        else:
+            names.append(repr(processor))
+
+    return names
+
+def test_configures_structlog_with_shared_processors(structlog_harness):
     config.setup_observability(log_level="debug")
 
-    configure_kwargs = calls["configure"]
-    assert configure_kwargs["processors"][:2] == [
-        config.structlog.contextvars.merge_contextvars,
-        config.structlog.processors.add_log_level,
+    processors = structlog_harness.configure_kwargs["processors"]
+
+    assert processor_pipeline_names(processors, structlog_harness) == [
+        "merge_contextvars",
+        "add_log_level",
+        "timestamp",
+        "format_exc_info",
+        "dict_tracebacks",
+        "inject_opentelemetry_context",
+        "json_renderer",
     ]
-    assert isinstance(configure_kwargs["processors"][2], config.structlog.processors.TimeStamper)
-    assert configure_kwargs["processors"][3:6] == [
-        config.structlog.processors.format_exc_info,
-        config.structlog.processors.dict_tracebacks,
-        inject_opentelemetry_context,
+    assert processors[2].kwargs == {"fmt": "iso", "utc": True, "key": "timestamp"}
+    assert structlog_harness.configure_kwargs["wrapper_class"] is (
+        structlog_harness.FilteringBoundLogger
+    )
+    assert structlog_harness.configure_kwargs["cache_logger_on_first_use"] is True
+    assert structlog_harness.configure_kwargs["logger_factory"].file is (
+        structlog_harness.stdout
+    )
+    assert structlog_harness.filtering_levels == [logging.DEBUG]
+
+def test_configures_root_logger_with_structlog_formatter(structlog_harness):
+    config.setup_observability()
+
+    root_logger = logging.getLogger()
+
+    assert root_logger.level == logging.INFO
+    assert len(root_logger.handlers) == 1
+    assert root_logger.handlers[0].stream is structlog_harness.stdout
+    assert isinstance(
+        root_logger.handlers[0].formatter,
+        structlog_harness.ProcessorFormatter,
+    )
+
+    formatter_kwargs = structlog_harness.formatter_kwargs[0]
+    assert isinstance(formatter_kwargs["processor"], structlog_harness.JSONRenderer)
+    assert processor_pipeline_names(
+        formatter_kwargs["foreign_pre_chain"],
+        structlog_harness,
+    ) == [
+        "wrap_for_formatter",
+        "merge_contextvars",
+        "add_log_level",
+        "timestamp",
+        "format_exc_info",
+        "dict_tracebacks",
+        "inject_opentelemetry_context",
     ]
-    assert isinstance(configure_kwargs["processors"][6], config.structlog.processors.JSONRenderer)
-    assert configure_kwargs["wrapper_class"] is fake_filtering_bound_logger
-    assert configure_kwargs["logger_factory"].file is stdout
-    assert configure_kwargs["cache_logger_on_first_use"] is True
-    assert calls["filtering_levels"] == [logging.DEBUG]
-    assert calls["timestamp_kwargs"][0] == {"fmt": "iso", "utc": True, "key": "timestamp"}
 
 @pytest.mark.parametrize(
     ("log_level", "expected_level"),
     [
         ("warning", logging.WARNING),
-        ("NOT_A_LEVEL", logging.INFO),
+        ("ERROR", logging.ERROR),
+        ("not-a-real-level", logging.INFO),
     ],
 )
-def test_setup_observability_configures_basic_logging_level(
-    structlog_spies,
+def test_applies_configured_log_level_to_root_and_structlog(
+    structlog_harness,
     log_level,
     expected_level,
 ):
-    calls, stdout, _, _ = structlog_spies
-
     config.setup_observability(log_level=log_level)
 
-    assert calls["basic_config"] == {
-        "format": "%(message)s",
-        "stream": stdout,
-        "level": expected_level,
-    }
-    assert calls["filtering_levels"] == [expected_level]
+    assert logging.getLogger().level == expected_level
+    assert structlog_harness.filtering_levels == [expected_level]
 
-def test_setup_observability_configures_root_logger_with_structlog_formatter(
-    structlog_spies,
-):
-    calls, stdout, _, fake_processor_formatter = structlog_spies
-
-    config.setup_observability()
-
-    root_logger = logging.getLogger()
-    assert len(root_logger.handlers) == 1
-    handler = root_logger.handlers[0]
-    assert isinstance(handler, logging.StreamHandler)
-    assert handler.stream is stdout
-    assert isinstance(handler.formatter, fake_processor_formatter)
-    assert calls["formatter_kwargs"] == [
-        {
-            "processor": handler.formatter.kwargs["processor"],
-            "foreign_pre_chain": [
-                config.structlog.processors.add_log_level,
-                handler.formatter.kwargs["foreign_pre_chain"][1],
-            ],
-        }
-    ]
-    assert isinstance(
-        handler.formatter.kwargs["processor"],
-        config.structlog.processors.JSONRenderer,
-    )
-    assert isinstance(
-        handler.formatter.kwargs["foreign_pre_chain"][1],
-        config.structlog.processors.TimeStamper,
-    )
-
-def test_setup_observability_configures_default_uvicorn_loggers(structlog_spies):
+def test_configures_default_framework_loggers(structlog_harness):
     config.setup_observability(log_level="ERROR")
 
     root_handler = logging.getLogger().handlers[0]
-    expected_levels = {
-        "uvicorn": logging.INFO,
-        "uvicorn.error": logging.INFO,
-        "uvicorn.access": logging.WARNING,
-    }
 
-    for logger_name, expected_level in expected_levels.items():
+    for logger_name, expected_level in MANAGED_LOGGERS.items():
         logger = logging.getLogger(logger_name)
         assert logger.handlers == [root_handler]
         assert logger.level == expected_level
         assert logger.propagate is False
 
-def test_setup_observability_merges_extra_loggers_and_allows_overrides(
-    structlog_spies,
-):
+def test_extra_loggers_can_override_defaults(structlog_harness):
     config.setup_observability(
         log_level="ERROR",
         extra_loggers={
@@ -215,17 +238,15 @@ def test_setup_observability_merges_extra_loggers_and_allows_overrides(
     )
 
     root_handler = logging.getLogger().handlers[0]
-    uvicorn_access_logger = logging.getLogger("uvicorn.access")
-    custom_logger = logging.getLogger("custom.logger")
 
-    assert uvicorn_access_logger.handlers == [root_handler]
-    assert uvicorn_access_logger.level == logging.DEBUG
-    assert uvicorn_access_logger.propagate is False
-    assert custom_logger.handlers == [root_handler]
-    assert custom_logger.level == logging.CRITICAL
-    assert custom_logger.propagate is False
+    assert logging.getLogger("uvicorn.access").handlers == [root_handler]
+    assert logging.getLogger("uvicorn.access").level == logging.DEBUG
+    assert logging.getLogger("uvicorn.access").propagate is False
+    assert logging.getLogger("custom.logger").handlers == [root_handler]
+    assert logging.getLogger("custom.logger").level == logging.CRITICAL
+    assert logging.getLogger("custom.logger").propagate is False
 
-def test_extra_logger_without_level_falls_back_to_configured_level(structlog_spies):
+def test_extra_logger_without_level_uses_configured_level(structlog_harness):
     config.setup_observability(
         log_level="ERROR",
         extra_loggers={"custom.logger": {}},
