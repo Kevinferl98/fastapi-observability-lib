@@ -25,6 +25,7 @@ class StructlogHarness:
     filtering_levels: list[int]
     formatter_kwargs: list[dict[str, Any]]
     FilteringBoundLogger: type
+    LoggerFactory: type
     TimeStamper: type
     JSONRenderer: type
     ProcessorFormatter: type
@@ -69,6 +70,9 @@ def structlog_harness(monkeypatch):
         def __init__(self, file):
             self.file = file
 
+    class LoggerFactory:
+        pass
+
     class TimeStamper:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
@@ -99,9 +103,31 @@ def structlog_harness(monkeypatch):
         "make_filtering_bound_logger",
         make_filtering_bound_logger,
     )
-    monkeypatch.setattr(config.structlog, "PrintLoggerFactory", PrintLoggerFactory)
-    monkeypatch.setattr(config.structlog.processors, "TimeStamper", TimeStamper)
-    monkeypatch.setattr(config.structlog.processors, "JSONRenderer", JSONRenderer)
+
+    monkeypatch.setattr(
+        config.structlog,
+        "PrintLoggerFactory",
+        PrintLoggerFactory,
+    )
+
+    monkeypatch.setattr(
+        config.structlog.stdlib,
+        "LoggerFactory",
+        LoggerFactory,
+    )
+
+    monkeypatch.setattr(
+        config.structlog.processors,
+        "TimeStamper",
+        TimeStamper,
+    )
+
+    monkeypatch.setattr(
+        config.structlog.processors,
+        "JSONRenderer",
+        JSONRenderer,
+    )
+
     monkeypatch.setattr(
         config.structlog.stdlib,
         "ProcessorFormatter",
@@ -114,6 +140,7 @@ def structlog_harness(monkeypatch):
         filtering_levels=filtering_levels,
         formatter_kwargs=formatter_kwargs,
         FilteringBoundLogger=FilteringBoundLogger,
+        LoggerFactory=LoggerFactory,
         TimeStamper=TimeStamper,
         JSONRenderer=JSONRenderer,
         ProcessorFormatter=ProcessorFormatter,
@@ -159,15 +186,23 @@ def test_configures_structlog_with_shared_processors(structlog_harness):
         "format_exc_info",
         "dict_tracebacks",
         "inject_opentelemetry_context",
-        "json_renderer",
+        "wrap_for_formatter",
     ]
-    assert processors[2].kwargs == {"fmt": "iso", "utc": True, "key": "timestamp"}
+
+    assert processors[2].kwargs == {
+        "fmt": "iso",
+        "utc": True,
+        "key": "timestamp",
+    }
+
     assert structlog_harness.configure_kwargs["wrapper_class"] is (
         structlog_harness.FilteringBoundLogger
     )
     assert structlog_harness.configure_kwargs["cache_logger_on_first_use"] is True
-    assert structlog_harness.configure_kwargs["logger_factory"].file is (
-        structlog_harness.stdout
+
+    assert isinstance(
+        structlog_harness.configure_kwargs["logger_factory"],
+        structlog_harness.LoggerFactory,
     )
     assert structlog_harness.filtering_levels == [logging.DEBUG]
 
@@ -185,12 +220,16 @@ def test_configures_root_logger_with_structlog_formatter(structlog_harness):
     )
 
     formatter_kwargs = structlog_harness.formatter_kwargs[0]
-    assert isinstance(formatter_kwargs["processor"], structlog_harness.JSONRenderer)
+
+    assert isinstance(
+        formatter_kwargs["processor"],
+        structlog_harness.JSONRenderer,
+    )
+
     assert processor_pipeline_names(
         formatter_kwargs["foreign_pre_chain"],
         structlog_harness,
     ) == [
-        "wrap_for_formatter",
         "merge_contextvars",
         "add_log_level",
         "timestamp",
